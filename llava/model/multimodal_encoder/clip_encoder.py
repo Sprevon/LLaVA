@@ -10,7 +10,7 @@ class CLIPVisionTower(nn.Module):
 
         self.is_loaded = False
 
-        self.vision_tower_name = vision_tower
+        self.vision_tower_name = "/root/autodl-tmp/model/clip-vit-large-patch14-336"
         self.select_layer = args.mm_vision_select_layer
         self.select_feature = getattr(args, 'mm_vision_select_feature', 'patch')
 
