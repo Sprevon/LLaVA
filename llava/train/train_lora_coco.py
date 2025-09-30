@@ -24,12 +24,13 @@ from peft import LoraConfig, get_peft_model
 
 # 如果 llava.constants 可用可以用它的常量，否则用下边默认
 try:
-    from llava.constants import IGNORE_INDEX as LLAVA_IGNORE_INDEX, IMAGE_TOKEN_INDEX
+    from llava.constants import IGNORE_INDEX as LLAVA_IGNORE_INDEX
+    from llava.constants import IMAGE_TOKEN_INDEX
 
     IGNORE_INDEX = LLAVA_IGNORE_INDEX
 except Exception:
     IGNORE_INDEX = -100
-    IMAGE_TOKEN_INDEX = None
+    IMAGE_TOKEN_INDEX = -200
 
 DEFAULT_IMAGE_TOKEN = "<image>"
 
@@ -74,22 +75,22 @@ class COCOCaptionDataset(Dataset):
     def __getitem__(self, idx):
         item = self.dataset[idx]
         image = item["image"]
-        question = item["question"] + DEFAULT_IMAGE_TOKEN
+        question = item["question"]
         answer = item["answer"][0]
-    
+
         prompt = f"Question: {question}\nAnswer: {answer}"
-        input_text = f"{DEFAULT_IMAGE_TOKEN}\n{prompt}"
 
-        # llava 的 tokenizer_image_token 会把 <image> 占位符转成对应 token id(s)
-        from llava.mm_utils import tokenizer_image_token  # import locally
-
-        input_ids = tokenizer_image_token(
-            input_text, self.tokenizer, return_tensors="pt"
-        ).squeeze(0)
+        input_ids = self.tokenizer(prompt, return_tensors="pt")["input_ids"].squeeze(
+            0
+        )  # (L,)
+        image_token_id = self.tokenizer.pad_token_id
+        input_ids = torch.cat(
+            [torch.tensor([image_token_id], dtype=torch.long), input_ids], dim=0
+        )
 
         q_len = len(self.tokenizer(f"Question: {question}\nAnswer: ")["input_ids"])
         labels = input_ids.clone()
-        labels[:q_len] = IGNORE_INDEX
+        labels[1 : q_len + 1] = IGNORE_INDEX
 
         # 图片 -> pixel_values
         pixel_values = self.image_processor(images=image, return_tensors="pt")[
@@ -135,17 +136,31 @@ def find_all_linear_names(model):
 
 class MultimodalTrainer(Trainer):
     """
-    关键在 compute_loss: 把 vision features 投影到 token embedding 维度，
-    然后替换 inputs_embeds 中对应的 <image> token embedding，再 forward LM。
+    Multimodal Trainer:
+    - 把 CLIP 提取的 vision features 投影到 LLM 的 embedding 空间
+    - 替换掉 input_ids 里对应 <image> token 的 embedding
     """
 
     def __init__(
-        self, *args, tokenizer=None, clip_model=None, mm_projector=None, **kwargs
+        self,
+        *args,
+        tokenizer=None,
+        clip_model=None,
+        mm_projector=None,
+        image_token: str = "<image>",
+        **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.tokenizer = tokenizer
         self.clip_model = clip_model
         self.mm_projector = mm_projector
+
+        # 确保 tokenizer 里有 <image> token
+        # if image_token not in tokenizer.get_vocab():
+        #     tokenizer.add_special_tokens({"additional_special_tokens": [image_token]})
+        #     print(f"✅ Added {image_token} to tokenizer")
+        # self.image_token = image_token
+        # self.image_token_id = tokenizer.convert_tokens_to_ids(image_token)
 
     def get_train_dataloader(self):
         return DataLoader(
@@ -159,53 +174,29 @@ class MultimodalTrainer(Trainer):
 
     def compute_loss(self, model, inputs, return_outputs=False):
         device = model.device
-        # move tensors to model device
+        # === 1. Move tensors to device ===
         input_ids = inputs["input_ids"].to(device)
         labels = inputs["labels"].to(device)
         pixel_values = inputs["pixel_values"].to(device)
         attention_mask = inputs.get("attention_mask", None)
         if attention_mask is not None:
             attention_mask = attention_mask.to(device)
-
-        # 1) get image features from CLIP
+        # === 2. Vision Encoder (CLIP) ===
         with torch.no_grad():
-            image_feats = self.clip_model.get_image_features(pixel_values)
-
-        # 2) project to token embedding dim
-        projected = self.mm_projector(image_feats)  # (B, token_emb_dim)
-
-        # 3) get token embeddings for input_ids
-        inputs_embeds = model.get_input_embeddings()(input_ids)
-
-        # 4) find image token positions
-        vocab_size = self.tokenizer.vocab_size
-        image_token_id = (
-            IMAGE_TOKEN_INDEX
-            if IMAGE_TOKEN_INDEX is not None
-            else self.tokenizer.convert_tokens_to_ids(DEFAULT_IMAGE_TOKEN)
-        )
-        # TODO:修改 token 位置逻辑
-        if image_token_id is None or image_token_id >= vocab_size:
-            # fallback to unk or first token
-            image_token_id = self.tokenizer.unk_token_id
+            image_feats = self.clip_model.get_image_features(
+                pixel_values
+            )  # (B, D_clip)
+        # === 3. Project to LM embedding dim ===
+        projected = self.mm_projector(image_feats)  # (B, D_lm)
+        # === 4. Replace <image> token embeddings ===
+        inputs_embeds = model.get_input_embeddings()(input_ids)  # (B, L, D_lm)
 
         batch_size, seq_len = input_ids.shape
         for i in range(batch_size):
-            ids = input_ids[i]
-            # boolean mask for image token positions, clamp idx to seq_len-1
-            pos = (ids == image_token_id).nonzero(as_tuple=False)
-            if pos.numel() == 0:
-                idx_pos = 0
-            else:
-                idx_pos = int(pos[0].item())
-                if idx_pos >= seq_len:
-                    idx_pos = seq_len - 1
+            idx_pos = 0
+            inputs_embeds[i, idx_pos, :] = projected[i]
 
-            # replace embedding at idx_pos
-            emb = projected[i]  # (emb_dim,)
-            inputs_embeds[i, idx_pos, :] = emb
-
-        # 5) forward LM using inputs_embeds
+        # === 5. Forward LM ===
         outputs = model(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
@@ -227,6 +218,7 @@ def train():
     model = LlavaLlamaForCausalLM.from_pretrained(
         model_args.model_name_or_path, torch_dtype=torch.float16, device_map="auto"
     )
+    model.resize_token_embeddings(len(tokenizer))
 
     # CLIP
     clip_model = CLIPModel.from_pretrained(model_args.vision_tower).to(device)
@@ -257,19 +249,6 @@ def train():
     hf_ds = load_dataset(data_args.hf_dataset_path, split=data_args.split)
     dataset = COCOCaptionDataset(hf_ds, tokenizer, clip_processor, max_length=256)
 
-    # print(dataset[0].keys())
-    # dict_keys(['input_ids', 'labels', 'pixel_values'])
-    # dataLoader = DataLoader(
-    #     dataset=dataset,
-    #     batch_size=8,
-    #     collate_fn=lambda x: multimodal_collate_fn(x, tokenizer),
-    # )
-    # loader_iter = iter(dataLoader)
-    # batch = next(loader_iter)
-    # print(batch.keys())
-    # dict_keys(['input_ids', 'labels', 'pixel_values', 'attention_mask'])
-    # return
-
     trainer = MultimodalTrainer(
         model=model,
         args=training_args,
@@ -283,6 +262,10 @@ def train():
     trainer.train()
 
     model.save_pretrained(os.path.join(training_args.output_dir, "lora_weights"))
+    torch.save(
+        mm_projector.state_dict(),
+        os.path.join(training_args.output_dir, "mm_projector.pt"),
+    )
     tokenizer.save_pretrained(training_args.output_dir)
 
 
