@@ -147,7 +147,6 @@ class MultimodalTrainer(Trainer):
         tokenizer=None,
         clip_model=None,
         mm_projector=None,
-        image_token: str = "<image>",
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
